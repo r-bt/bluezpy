@@ -14,12 +14,23 @@
 #include "lib/acl_packet.h"
 #include "lib/hci_event_packet.h"
 #include <iomanip>
+#include <unordered_map>
+#include <queue>
+#include <Python.h>
+#include <thread>
+#include <mutex>
+
+std::queue<std::pair<std::string, std::vector<unsigned char>>> packetQueue;
+std::mutex queueMutex;
 
 struct HCIAdapter
 {
     int deviceId;
     int socket;
 };
+
+using handle_map = std::unordered_map<uint16_t, bdaddr_t>;
+using device_map = std::unordered_map<int, handle_map>;
 
 /**
  * Creates a HCI socket and returns the file descriptor.
@@ -113,6 +124,8 @@ std::vector<HCIAdapter> get_hci_adapters()
     {
         int devId = devInfo.dev_id;
 
+        std::string message = "Device id: " + std::to_string(devId) + "\n";
+
         if (devId == initalDeviceId)
         {
             continue;
@@ -131,114 +144,87 @@ std::vector<HCIAdapter> get_hci_adapters()
     return adapters;
 }
 
-void handle_acl_packet(ACLPacket::ACL_PACKET packet)
+void handle_acl_packet(ACLPacket::ACL_PACKET const &packet, handle_map &handleToAddress)
 {
+    // Check if the packet is an ATT Handle Value Notification (0x1B is the opcode for ATT Handle Value Notification)
+    if (packet.payload[4] != 0x1B)
+    {
+        return;
+    };
+
+    uint16_t handle = packet.handle;
+
+    // Make sure the handle maps to a Bluetooth address
+    if (handleToAddress.find(handle) == handleToAddress.end())
+    {
+        return;
+    }
+
+    char addressStr[18];
+    ba2str(&handleToAddress[handle], addressStr);
+
+    // Get the packet data
+
+    std::vector<unsigned char> extractedValue;
+
+    int startOffset = 7; // Assuming this is the inclusive start offset
+    int numElements = packet.dataLength - startOffset;
+
+    const unsigned char *payloadPtr = packet.payload + startOffset;
+
+    extractedValue.reserve(numElements);
+    extractedValue.insert(extractedValue.end(), payloadPtr, payloadPtr + numElements);
+
+    // Add it to the queue
+
+    std::lock_guard<std::mutex> lock(queueMutex);
+
+    packetQueue.push(std::make_pair(std::string(addressStr), extractedValue));
 }
 
-void handle_hci_event_packet(HCIEventPacket::HCIEventPacket packet)
+void handle_hci_event_packet(HCIEventPacket::HCIEventPacket const &packet, handle_map &handleToAddress)
 {
     if (packet.eventCode != EVT_LE_META_EVENT)
     {
         return;
     }
 
-    uint8_t eventCode = packet.eventCode;
-    std::cout << "Event Code: 0x" << std::hex << static_cast<int>(eventCode) << std::endl;
-    std::cout << "Parameters: ";
-    for (int i = 0; i < packet.parameterTotalLength; ++i)
+    evt_le_meta_event *evt = (evt_le_meta_event *)packet.parameters;
+
+    switch (evt->subevent)
     {
-        std::cout << std::setw(2) << std::setfill('0') << static_cast<int>(packet.parameters[i]) << " ";
+    case EVT_LE_CONN_COMPLETE:
+    {
+        evt_le_connection_complete *cc = (evt_le_connection_complete *)evt->data;
+
+        handleToAddress[cc->handle] = cc->peer_bdaddr;
     }
-    std::cout << std::endl;
+    }
 }
 
-void print_packet(const unsigned char *packet, int debug_length)
+void handle_packet(const unsigned char *packet, handle_map &handleToAddress)
 {
     switch (packet[0])
     {
     case HCI_ACLDATA_PKT:
     {
         ACLPacket::ACL_PACKET acl_packet = ACLPacket::parse(packet + 1);
-        handle_acl_packet(acl_packet);
+        handle_acl_packet(acl_packet, handleToAddress);
         break;
     }
     case HCI_EVENT_PKT:
     {
         HCIEventPacket::HCIEventPacket hci_event_packet = HCIEventPacket::parse(packet + 1);
-        handle_hci_event_packet(hci_event_packet);
+        handle_hci_event_packet(hci_event_packet, handleToAddress);
         break;
     }
     }
-
-    // std::cout << "Packet[0] value: " << std::hex << static_cast<int>(packet[0]) << std::endl;
-
-    // std::cout << "Payload: ";
-    // for (int i = 0; i < debug_length; ++i)
-    // {
-    //     std::cout << std::hex << static_cast<int>(packet[i]) << " ";
-    // }
-    // std::cout << std::endl;
-    // We remove the first byte since it contains the packet type
-    // ACLPacket::ACL_PACKET acl_packet = ACLPacket::parse(packet + 1);
-
-    // uint16_t handle = acl_packet.handle;
-    // std::cout << "Handle: " << handle << std::endl;
-
-    // uint16_t length = acl_packet.dataLength;
-    // std::cout << "Length: " << std::dec << acl_packet.dataLength << std::endl;
-
-    // std::cout << "PB: " << ACLPacket::pb_to_str(acl_packet.pb) << std::endl;
-
-    // const unsigned char *payload = acl_packet.payload;
-    // std::cout << "Payload: ";
-    // for (int i = 0; i < length; ++i)
-    // {
-    //     std::cout << std::hex << static_cast<int>(payload[i]) << " ";
-    // }
-    // std::cout << std::endl;
-
-    // if (packet[0] == HCI_EVENT_PKT)
-    // {
-    //     // Extract the Bluetooth address from the HCI event header
-    //     bdaddr_t address;
-    //     bacpy(&address, reinterpret_cast<const bdaddr_t *>(&packet[3]));
-
-    //     // Print the Bluetooth address
-    //     char addressStr[18];
-    //     ba2str(&address, addressStr);
-    //     std::cout << "Bluetooth Address: " << addressStr << std::endl;
-    // }
-    // else if (packet[0] == HCI_ACLDATA_PKT)
-    // {
-    //     // Check if the packet is an ATT Handle Value Notification (0x1B is the opcode for ATT Handle Value Notification)
-    //     if (packet[9] == 0x1B)
-    //     {
-    //         // Extract the Attribute Handle
-    //         uint16_t attributeHandle = packet[10] | (packet[11] << 8);
-
-    //         // Extract an arbitrary length value starting from a specific offset (e.g., offset 12)
-    //         std::vector<unsigned char> extractedValue;
-    //         int offset = 12;
-    //         while (offset < length)
-    //         {
-    //             extractedValue.push_back(packet[offset]);
-    //             offset++;
-    //         }
-
-    //         // Print the Attribute Handle and Attribute Value
-    //         std::cout << "Attribute Handle: " << attributeHandle << std::endl;
-    //         std::cout << "Attribute Value: ";
-    //         for (auto byte : extractedValue)
-    //         {
-    //             printf("%02X ", byte);
-    //         }
-    //         std::cout << std::endl;
-    //     }
-    // }
 }
 
-int main()
+void init()
 {
+    // Py_BEGIN_ALLOW_THREADS;
+
     std::vector<HCIAdapter> adapters = get_hci_adapters();
 
     // We'll store a vector of pollfds
@@ -251,7 +237,6 @@ int main()
         hci_filter_clear(&filter);
         hci_filter_set_ptype(HCI_ACLDATA_PKT, &filter);
         hci_filter_set_ptype(HCI_EVENT_PKT, &filter);
-        hci_filter_set_event(EVT_LE_CONN_COMPLETE, &filter);
         hci_filter_set_event(EVT_LE_META_EVENT, &filter);
 
         if (setsockopt(adapter.socket, SOL_HCI, HCI_FILTER, &filter, sizeof(filter)) < 0)
@@ -265,6 +250,9 @@ int main()
         fds[adapter.deviceId].fd = adapter.socket;
         fds[adapter.deviceId].events = POLLIN;
     }
+
+    // We need to map deviceIds to a map of handles to addresses
+    device_map deviceToHandleToAddress;
 
     // Poll for incoming packets
     while (true)
@@ -285,9 +273,65 @@ int main()
                 int bytesRead = read(adapter.socket, buffer.data(), buffer.size());
                 if (bytesRead > 0)
                 {
-                    print_packet(buffer.data(), bytesRead);
+                    handle_packet(buffer.data(), deviceToHandleToAddress[adapter.deviceId]);
                 }
             }
         }
     }
+
+    // Py_END_ALLOW_THREADS;
+}
+
+static std::thread bluezListeningThread;
+
+static PyObject *listen(PyObject *self, PyObject *args)
+{
+    if (!bluezListeningThread.joinable())
+    {
+        bluezListeningThread = std::thread(init);
+        bluezListeningThread.detach();
+    }
+
+    Py_RETURN_NONE;
+}
+
+PyObject *get_packet(PyObject *self, PyObject *args)
+{
+    std::lock_guard<std::mutex> lock(queueMutex);
+
+    if (packetQueue.empty())
+        Py_RETURN_NONE;
+
+    auto item = packetQueue.front();
+    packetQueue.pop();
+
+    // Create a Python string object for the address
+    PyObject *addressObj = PyUnicode_FromString(item.first.c_str());
+
+    // Create a Python bytearray object for the packets
+    PyObject *packetsByteArray = PyByteArray_FromStringAndSize(reinterpret_cast<const char *>(item.second.data()), item.second.size());
+
+    // Create a tuple object with the address and packets
+    PyObject *returnValue = PyTuple_New(2);
+    PyTuple_SetItem(returnValue, 0, addressObj);
+    PyTuple_SetItem(returnValue, 1, packetsByteArray);
+
+    return returnValue;
+}
+
+static PyMethodDef BluezPyMethods[] = {
+    {"listen", listen, METH_VARARGS, "Listen for Bluetooth packets"},
+    {"get_packet", get_packet, METH_NOARGS, "Get the first packet from the queue."},
+    {NULL, NULL, 0, NULL}};
+
+static struct PyModuleDef bluezpy = {
+    PyModuleDef_HEAD_INIT,
+    "bluezpy",
+    "Bluez Python module",
+    -1,
+    BluezPyMethods};
+
+PyMODINIT_FUNC PyInit_bluezpy(void)
+{
+    return PyModule_Create(&bluezpy);
 }
